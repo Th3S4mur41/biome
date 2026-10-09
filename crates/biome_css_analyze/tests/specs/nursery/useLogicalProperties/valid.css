@@ -1,5 +1,7 @@
 /* should not generate diagnostics */
 .size {
+	margin: 1rem;
+	padding: 2rem;
 	inline-size: 100%;
 	min-inline-size: 20rem;
 	max-inline-size: 80rem;

@@ -1,9 +1,18 @@
 use crate::CssRuleAction;
 use biome_analyze::{Ast, FixKind, Rule, RuleDiagnostic, context::RuleContext, declare_lint_rule};
 use biome_console::markup;
+use biome_css_factory::make::{
+    css_declaration, css_declaration_list, css_declaration_or_at_rule_list,
+    css_declaration_or_rule_list, css_declaration_with_semicolon,
+    css_generic_component_value_list,
+};
 use biome_css_syntax::{
-    AnyCssFunction, AnyCssGenericPropertyValueOrExpression, AnyCssValue, CssFunction,
-    CssGenericProperty, CssSyntaxToken, decode_css_identifier,
+    AnyCssDeclaration, AnyCssDeclarationOrAtRule, AnyCssDeclarationOrRule, AnyCssFunction,
+    AnyCssGenericComponentValue, AnyCssGenericPropertyValueOrExpression, AnyCssProperty,
+    AnyCssValue, CssDeclaration,
+    CssDeclarationList, CssDeclarationOrAtRuleList, CssDeclarationOrRuleList,
+    CssDeclarationWithSemicolon, CssFunction, CssGenericProperty, CssSyntaxKind, CssSyntaxToken,
+    TriviaPieceKind, decode_css_identifier,
 };
 use biome_diagnostics::Severity;
 use biome_rowan::{AstNode, AstNodeList, AstSeparatedList, BatchMutationExt, TextRange};
@@ -17,7 +26,8 @@ declare_lint_rule! {
     ///
     /// Physical properties such as `left`, `margin-left`, and `width` describe fixed directions or
     /// dimensions. Logical properties such as `inset-inline-start`, `margin-inline-start`, and
-    /// `inline-size` adapt when text runs right to left or uses a vertical writing mode.
+    /// `inline-size` adapt when text runs right to left or uses a vertical writing mode. Split
+    /// multi-value `margin` and `padding` shorthands into logical block and inline properties.
     ///
     /// ## Examples
     ///
@@ -38,6 +48,12 @@ declare_lint_rule! {
     /// ```css,expect_diagnostic
     /// p {
     ///   margin-left: 1rem;
+    /// }
+    /// ```
+    ///
+    /// ```css,expect_diagnostic
+    /// p {
+    ///   margin: 1rem 2rem;
     /// }
     /// ```
     ///
@@ -84,6 +100,8 @@ declare_lint_rule! {
     ///   inline-size: 100%;
     ///   inset-block-start: 0;
     ///   margin-inline-start: 1rem;
+    ///   margin-block: 1rem;
+    ///   margin-inline: 2rem;
     ///   border-inline-start: 1px solid;
     ///   float: inline-start;
     ///   text-align: end;
@@ -167,6 +185,16 @@ impl Rule for UseLogicalProperties {
             });
         }
 
+        if matches!(normalized_name.as_ref(), "margin" | "padding")
+            && let Some(violation) = logical_shorthand_violation(property)
+        {
+            states.push(UseLogicalPropertiesState {
+                span: name.range(),
+                token: name_token.clone(),
+                violation,
+            });
+        }
+
         collect_value_violations(property, normalized_name.as_ref(), direction, &mut states);
 
         states.into_boxed_slice()
@@ -188,6 +216,20 @@ impl Rule for UseLogicalProperties {
             }));
         }
 
+        match state.violation {
+            LogicalPropertiesViolation::LogicalShorthand => {
+                return Some(diagnostic.note(markup! {
+                    "Split the shorthand into block and inline logical properties."
+                }));
+            }
+            LogicalPropertiesViolation::DynamicLogicalShorthand => {
+                return Some(diagnostic.note(markup! {
+                    "A dynamic substitution can change the number of values, so this shorthand cannot be expanded automatically."
+                }));
+            }
+            _ => {}
+        }
+
         Some(if let Some(replacement) = state.replacement() {
             let decoded = decode_css_identifier(state.token.text_trimmed());
             let physical = decoded.to_ascii_lowercase_cow();
@@ -202,6 +244,10 @@ impl Rule for UseLogicalProperties {
     }
 
     fn action(ctx: &RuleContext<Self>, state: &Self::State) -> Option<CssRuleAction> {
+        if matches!(state.violation, LogicalPropertiesViolation::LogicalShorthand) {
+            return shorthand_action(ctx);
+        }
+
         let replacement = state.replacement()?;
         let mut mutation = ctx.root().begin();
         let new_token = CssSyntaxToken::new_detached(state.token.kind(), replacement, [], []);
@@ -239,6 +285,8 @@ enum LogicalPropertiesViolation {
     AnchorValue {
         replacement: &'static str,
     },
+    LogicalShorthand,
+    DynamicLogicalShorthand,
 }
 
 impl UseLogicalPropertiesState {
@@ -260,6 +308,10 @@ impl UseLogicalPropertiesState {
                 "Use a logical size in anchor-size()."
             }
             LogicalPropertiesViolation::AnchorValue { .. } => "Use a logical side in anchor().",
+            LogicalPropertiesViolation::LogicalShorthand
+            | LogicalPropertiesViolation::DynamicLogicalShorthand => {
+                "Use logical properties instead of a physical margin or padding shorthand."
+            }
         }
     }
 
@@ -270,9 +322,256 @@ impl UseLogicalPropertiesState {
             | LogicalPropertiesViolation::AnchorSizeValue { replacement }
             | LogicalPropertiesViolation::AnchorValue { replacement } => Some(replacement),
             LogicalPropertiesViolation::JustifyContentValue
-            | LogicalPropertiesViolation::LegacyAlignmentValue => None,
+            | LogicalPropertiesViolation::LegacyAlignmentValue
+            | LogicalPropertiesViolation::LogicalShorthand
+            | LogicalPropertiesViolation::DynamicLogicalShorthand => None,
         }
     }
+}
+
+fn logical_shorthand_violation(
+    property: &CssGenericProperty,
+) -> Option<LogicalPropertiesViolation> {
+    let AnyCssGenericPropertyValueOrExpression::CssGenericComponentValueList(values) =
+        property.value().ok()?
+    else {
+        return None;
+    };
+    let components = values.iter().collect::<Vec<_>>();
+    if !(2..=4).contains(&components.len())
+        || components
+            .iter()
+            .any(|component| component.as_any_css_value().is_none())
+    {
+        return None;
+    }
+
+    Some(if components.iter().any(|component| {
+        let Some(AnyCssValue::AnyCssFunction(AnyCssFunction::CssFunction(function))) =
+            component.as_any_css_value()
+        else {
+            return false;
+        };
+        function_name(function).is_some_and(|token| {
+            matches!(
+                decode_css_identifier(token.text_trimmed())
+                    .to_ascii_lowercase_cow()
+                    .as_ref(),
+                "var" | "env"
+            )
+        })
+    }) {
+        LogicalPropertiesViolation::DynamicLogicalShorthand
+    } else {
+        LogicalPropertiesViolation::LogicalShorthand
+    })
+}
+
+fn shorthand_action(ctx: &RuleContext<UseLogicalProperties>) -> Option<CssRuleAction> {
+    let property = ctx.query();
+    let name = property.name().ok()?;
+    let name_token = name.as_css_identifier()?.value_token().ok()?;
+    let decoded_name = decode_css_identifier(name_token.text_trimmed());
+    let property_name = decoded_name.to_ascii_lowercase_cow();
+    let block_name = match property_name.as_ref() {
+        "margin" => "margin-block",
+        "padding" => "padding-block",
+        _ => return None,
+    };
+    let inline_name = match property_name.as_ref() {
+        "margin" => "margin-inline",
+        "padding" => "padding-inline",
+        _ => return None,
+    };
+    let AnyCssGenericPropertyValueOrExpression::CssGenericComponentValueList(values) =
+        property.value().ok()?
+    else {
+        return None;
+    };
+    let components = values.iter().collect::<Vec<_>>();
+    if !(2..=4).contains(&components.len()) {
+        return None;
+    }
+
+    let (block_indices, inline_indices) = match components.len() {
+        2 => (vec![0], vec![1]),
+        3 => (vec![0, 2], vec![1]),
+        4 => match ctx.options().direction() {
+            UseLogicalPropertiesDirection::Ltr => (vec![0, 2], vec![3, 1]),
+            UseLogicalPropertiesDirection::Rtl => (vec![0, 2], vec![1, 3]),
+        },
+        _ => return None,
+    };
+    let declaration = property
+        .syntax()
+        .parent()
+        .and_then(CssDeclaration::cast)?;
+    let wrapper = declaration
+        .syntax()
+        .parent()
+        .and_then(CssDeclarationWithSemicolon::cast)?;
+    let important = declaration.important();
+    let block_property = shorthand_property(
+        property,
+        block_name,
+        &components,
+        &block_indices,
+        important.is_some(),
+    )?;
+    let inline_property = shorthand_property(
+        property,
+        inline_name,
+        &components,
+        &inline_indices,
+        important.is_some(),
+    )?;
+    let make_declaration = |property: CssGenericProperty, semicolon: Option<CssSyntaxToken>| {
+        let mut builder = css_declaration(AnyCssProperty::from(property));
+        if let Some(important) = important.clone() {
+            builder = builder.with_important(important);
+        }
+        let declaration = builder.build();
+        let mut builder = css_declaration_with_semicolon(declaration);
+        if let Some(semicolon) = semicolon {
+            builder = builder.with_semicolon_token(semicolon);
+        }
+        builder.build()
+    };
+
+    let block_declaration = make_declaration(
+        block_property,
+        Some(CssSyntaxToken::new_detached(
+            CssSyntaxKind::SEMICOLON,
+            ";",
+            [],
+            [],
+        )),
+    );
+    let inline_declaration = make_declaration(inline_property, wrapper.semicolon_token());
+    let mut mutation = ctx.root().begin();
+    let parent = wrapper.syntax().parent()?;
+
+    if let Some(list) = CssDeclarationList::cast(parent.clone()) {
+        let mut items = Vec::with_capacity(list.len() + 1);
+        for item in list.iter() {
+            if item.syntax() == wrapper.syntax() {
+                items.push(AnyCssDeclaration::from(block_declaration.clone()));
+                items.push(AnyCssDeclaration::from(inline_declaration.clone()));
+            } else {
+                items.push(item);
+            }
+        }
+        mutation.replace_node(list.clone(), css_declaration_list(items));
+    } else if let Some(list) = CssDeclarationOrAtRuleList::cast(parent.clone()) {
+        let mut items = Vec::with_capacity(list.len() + 1);
+        for item in list.iter() {
+            if item.syntax() == wrapper.syntax() {
+                items.push(AnyCssDeclarationOrAtRule::from(block_declaration.clone()));
+                items.push(AnyCssDeclarationOrAtRule::from(inline_declaration.clone()));
+            } else {
+                items.push(item);
+            }
+        }
+        mutation.replace_node(list.clone(), css_declaration_or_at_rule_list(items));
+    } else if let Some(list) = CssDeclarationOrRuleList::cast(parent) {
+        let mut items = Vec::with_capacity(list.len() + 1);
+        for item in list.iter() {
+            if item.syntax() == wrapper.syntax() {
+                items.push(AnyCssDeclarationOrRule::from(block_declaration.clone()));
+                items.push(AnyCssDeclarationOrRule::from(inline_declaration.clone()));
+            } else {
+                items.push(item);
+            }
+        }
+        mutation.replace_node(list.clone(), css_declaration_or_rule_list(items));
+    } else {
+        return None;
+    }
+
+    Some(CssRuleAction::new(
+        ctx.metadata().action_category(ctx.category(), ctx.group()),
+        ctx.metadata().applicability(),
+        markup! { "Split into logical properties." }.to_owned(),
+        mutation,
+    ))
+}
+
+fn shorthand_property(
+    property: &CssGenericProperty,
+    name: &str,
+    components: &[biome_css_syntax::AnyCssGenericComponentValue],
+    indices: &[usize],
+    important: bool,
+) -> Option<CssGenericProperty> {
+    let declaration_name = property.name().ok()?.as_css_identifier()?.clone();
+    let name_token = declaration_name.value_token().ok()?;
+    let name_token = CssSyntaxToken::new_detached(name_token.kind(), name, [], [])
+        .with_leading_trivia_pieces(name_token.leading_trivia().pieces())
+        .with_trailing_trivia_pieces(name_token.trailing_trivia().pieces());
+    let declaration_name = declaration_name.with_value_token(name_token);
+    let components = indices
+        .iter()
+        .enumerate()
+        .map(|(position, index)| {
+            normalize_shorthand_component(
+                components[*index].clone(),
+                position > 0,
+                position + 1 == indices.len() && important,
+            )
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        property
+            .clone()
+            .with_name(declaration_name.into())
+            .with_value(css_generic_component_value_list(components).into()),
+    )
+}
+
+fn normalize_shorthand_component(
+    component: AnyCssGenericComponentValue,
+    add_leading_space: bool,
+    add_trailing_space: bool,
+) -> Option<AnyCssGenericComponentValue> {
+    let syntax = component.into_syntax().trim_trivia()?;
+    let original_first_token = syntax.first_token()?;
+    let comments = original_first_token
+        .leading_trivia()
+        .pieces()
+        .filter(|piece| !piece.is_whitespace() && !piece.is_newline())
+        .collect::<Vec<_>>();
+    let mut leading_trivia = Vec::with_capacity(comments.len() + usize::from(add_leading_space));
+    if add_leading_space {
+        leading_trivia.push((TriviaPieceKind::Whitespace, " "));
+    }
+    leading_trivia.extend(
+        comments
+            .iter()
+            .map(|piece| (piece.kind(), piece.text())),
+    );
+    let new_first_token = original_first_token.with_leading_trivia(leading_trivia);
+    let syntax = syntax.replace_child(original_first_token.into(), new_first_token.into())?;
+    let original_last_token = syntax.last_token()?;
+    let trailing_comments = original_last_token
+        .trailing_trivia()
+        .pieces()
+        .filter(|piece| !piece.is_whitespace() && !piece.is_newline())
+        .collect::<Vec<_>>();
+    let mut trailing_trivia = Vec::with_capacity(
+        trailing_comments.len() + usize::from(add_trailing_space),
+    );
+    trailing_trivia.extend(
+        trailing_comments
+            .iter()
+            .map(|piece| (piece.kind(), piece.text())),
+    );
+    if add_trailing_space {
+        trailing_trivia.push((TriviaPieceKind::Whitespace, " "));
+    }
+    let new_last_token = original_last_token.with_trailing_trivia(trailing_trivia);
+    AnyCssGenericComponentValue::cast(
+        syntax.replace_child(original_last_token.into(), new_last_token.into())?,
+    )
 }
 
 /// Maps a physical property name to its logical `(ltr, rtl)` replacement names.
